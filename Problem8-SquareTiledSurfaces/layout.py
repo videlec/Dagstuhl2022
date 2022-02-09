@@ -6,6 +6,7 @@ Square-tiled surfaces are encoded as pairs ``(r, u)`` where both ``r`` and
 and ``i -> u[i]``.
 """
 
+from sage.all import MixedIntegerLinearProgram, Graph, DiGraph
 from sage.numerical.mip import MIPSolverException
 
 def origami_digraph(r, u, loops=True, multiedges=True):
@@ -28,7 +29,7 @@ def staircase_layout(r, u):
     return H if (H is not None and len(H) == len(G)) else None
 
 
-def soft_layout(r, u):
+def soft_layout(r, u, cut_first=False, all_overlaps=False, verbose=False):
     r"""
     Return a soft layout if any
 
@@ -102,28 +103,36 @@ def soft_layout(r, u):
         comps = G.connected_components()
         if len(comps) > 1:
             comp = set(comps[0])
-            cut = M.sum(r_cut[i] for i in comp if r[i] not in comp) + \
-                  M.sum(r_cut[r_inv[i]] for i in comp if r_inv[i] not in comp) + \
-                  M.sum(u_cut[i] for i in comp if u[i] not in comp) + \
-                  M.sum(u_cut[u_inv[i]] for i in comp if u_inv[i] not in comp)
-            M.add_constraint(cut >= 1)
+            if verbose:
+                print('forbid cut for {}'.format(comp))
+            rights = [i for i in comp if r[i] not in comp]
+            lefts = [r_inv[i] for i in comp if r_inv[i] not in comp]
+            ups = [i for i in comp if u[i] not in comp]
+            downs = [u_inv[i] for i in comp if u_inv[i] not in comp]
+            cut = M.sum(r_cut[i] for i in rights + lefts) + M.sum(u_cut[i] for i in ups + downs)
+            M.add_constraint(cut <= len(rights) + len(lefts) + len(ups) + len(downs) - 1)
+            if cut_first:
+                continue
 
         # forbid squares at the same position if any
         # (we avoid doing that too much since this potentially creates 2 n^2 new variables)
-        has_superposition = False
+        has_overlap = False
         for i in range(n):
             for j in range(i):
                 if vx[i] == vx[j] and vy[i] == vy[j]:
+                    if verbose:
+                        print('forbid overlap of squares {} and {}'.format(i, j))
                     M.add_constraint(x[i] - x[j] + 3 * n * xdiff[i,j] + y[i] - y[j] + 3 * n * ydiff[i,j] >= 1)
                     M.add_constraint(x[j] - x[i] + 3 * n * (1 - xdiff[i,j]) + y[i] - y[j] + 3 * n * ydiff[i,j] >= 1)
                     M.add_constraint(x[i] - x[j] + 3 * n * xdiff[i,j] + y[j] - y[i] + 3 * n * (1 - ydiff[i,j]) >= 1)
                     M.add_constraint(x[j] - x[i] + 3 * n * (1 - xdiff[i,j]) + y[j] - y[i] + 3 * n * (1 - ydiff[i,j]) >= 1)
-                    has_superposition = True
-                    break
-            if has_superposition:
+                    has_overlap = True
+                    if not all_overlaps:
+                        break
+            if has_overlap and not all_overlaps:
                 break
 
-        if len(comps) == 1 and not has_superposition:
+        if len(comps) == 1 and not has_overlap:
             G = DiGraph(n, multiedges=False, loops=False)
             for i in range(n):
                 if not vr_cut[i] and i != r[i]:
@@ -137,6 +146,7 @@ def soft_layout(r, u):
 ############
 
 def positions_from_layout(r, u, G):
+    assert G.is_connected()
     n = len(r)
     x_pos = [None] * n
     y_pos = [None] * n
