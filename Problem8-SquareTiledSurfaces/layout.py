@@ -9,9 +9,24 @@ and ``i -> u[i]``.
 from sage.all import MixedIntegerLinearProgram, Graph, DiGraph
 from sage.numerical.mip import MIPSolverException
 
+def origami_check(r, u):
+    if len(r) != len(u):
+        raise ValueError('r and u must be two lists of the same length')
+    n = len(r)
+    for i in range(n):
+        if i not in r:
+            raise ValueError('{} not present in r'.format(i))
+        if i not in u:
+            raise ValueError('{} not present in u'.format(i))
+    G = origami_digraph(r, u)
+    comps = G.connected_components()
+    if len(comps) != 1:
+        raise ValueError('not connected; connected components {}'.format(comps))
+
+
 def origami_digraph(r, u, loops=True, multiedges=True):
     n = len(r)
-    G = Digraph(loops=loops, multiedges=multiedges)
+    G = DiGraph(loops=loops, multiedges=multiedges)
     for i in range(n):
         if loops or r[i] != i:
             G.add_edge(i, r[i], 'r')
@@ -24,14 +39,150 @@ def staircase_layout(r, u):
     r"""
     Return a staircase layout if any
     """
+    origami_check(r, u)
     G = origami_digraph(r, u, loops=False, multiedges=False)
     H = G.hamiltonian_path(maximize=True)
     return H if (H is not None and len(H) == len(G)) else None
 
 
-def soft_layout(r, u, cut_first=False, all_overlaps=False, verbose=False):
+def soft_layout(r, u, snake=False, cut_first=False, all_overlaps=False, verbose=False):
     r"""
     Return a soft layout if any
+
+    This function uses integer linear programming and it is strongly advised to
+    use a decent solver. The only one installed by default in sage (GLPK) turns
+    out to be very slow.
+
+    INPUT:
+
+    - ``r`` and ``u`` -- permutations given as lists of lengths ``n`` containing the
+      integers from ``0`` to ``n-1``
+
+    - ``snake`` (optional boolean, default ``False``) -- whether we restrict the layout
+      to follow a path. This is a constrained version of the Hamiltonian path problem
+
+    - ``cut_first``, ``all_overlaps`` (boolean) -- technical parameters that modifies
+      how the LP is constructed
+
+    - ``verbose`` (boolean, default ``False``) -- whether to print additional
+      information during the run of the function
+    """
+    origami_check(r, u)
+    n = len(r)
+    r_inv = [None] * n
+    u_inv = [None] * n
+    for i in range(n):
+        r_inv[r[i]] = i
+        u_inv[u[i]] = i
+
+    # Variables
+    M = MixedIntegerLinearProgram()
+    x = M.new_variable(integer=True)    # x coordinate of each square
+    xdiff = M.new_variable(binary=True) # sign of each difference x[i] - x[j]
+    y = M.new_variable(integer=True)    # y coordinate of each square
+    ydiff = M.new_variable(binary=True) # sign of each difference y[i] - y[j]
+    r_cut = M.new_variable(binary=True) # whether (i, r[i]) is cut
+    u_cut = M.new_variable(binary=True) # whether (i, u[i]) is cut
+
+    # Constraints
+    M.add_constraint(x[0] == 0)
+    M.add_constraint(y[0] == 0)
+    for i in range(1, n):
+        # absolute bound on our window
+        M.add_constraint(x[i] >= -n)
+        M.add_constraint(x[i] <= n)
+        M.add_constraint(y[i] >= -n)
+        M.add_constraint(y[i] <= n)
+
+    for i in range(n):
+        # if not r-cut then x-difference is one and y-difference is zero
+        M.add_constraint(- 3 * n * r_cut[i] <= x[r[i]] - x[i] - 1)
+        M.add_constraint(x[r[i]] - x[i] - 1 <= 3 * n * r_cut[i])
+        M.add_constraint(- 3 * n * r_cut[i] <= y[r[i]] - y[i])
+        M.add_constraint(y[r[i]] - y[i] <= 3 * n * r_cut[i])
+
+        # if no u-cut then y-difference is one and x-difference is zero
+        M.add_constraint(- 3 * n * u_cut[i] <= y[u[i]] - y[i] - 1)
+        M.add_constraint(y[u[i]] - y[i] - 1 <= 3 * n * u_cut[i])
+        M.add_constraint(- 3 * n * u_cut[i] <= x[u[i]] - x[i])
+        M.add_constraint(x[u[i]] - x[i] <= 3 * n * u_cut[i])
+
+        if snake:
+            # each vertex should have degree one or two
+            M.add_constraint(r_cut[i] + u_cut[i] + r_cut[r_inv[i]] + u_cut[u_inv[i]] >= 2)
+
+    # leave some room for a spanning tree
+    M.add_constraint(M.sum(r_cut[i] for i in range(n)) + M.sum(u_cut[i] for i in range(n)) <= n + 1)
+
+    while True:
+        try:
+            M.solve()
+        except MIPSolverException:
+            return
+
+        vx = M.get_values(x)
+        vx = [int(vx[i]) for i in range(n)]
+        vy = M.get_values(y)
+        vy = [int(vy[i]) for i in range(n)]
+
+        # remove a cut if any
+        vr_cut = M.get_values(r_cut)
+        vu_cut = M.get_values(u_cut)
+        
+        G = Graph(n, multiedges=False, loops=False)
+        for i in range(n):
+            if not vr_cut[i] and i != r[i]:
+                G.add_edge(i, r[i], 'r')
+            if not vu_cut[i] and i != u[i]:
+                G.add_edge(i, u[i], 'u')
+        comps = G.connected_components()
+        if len(comps) > 1:
+            comp = set(comps[0])
+            if verbose:
+                print('forbid cut for {}'.format(comp))
+            rights = [i for i in comp if r[i] not in comp]
+            lefts = [r_inv[i] for i in comp if r_inv[i] not in comp]
+            ups = [i for i in comp if u[i] not in comp]
+            downs = [u_inv[i] for i in comp if u_inv[i] not in comp]
+            cut = M.sum(r_cut[i] for i in rights + lefts) + M.sum(u_cut[i] for i in ups + downs)
+            M.add_constraint(cut <= len(rights) + len(lefts) + len(ups) + len(downs) - 1)
+            if cut_first:
+                continue
+
+        # forbid squares at the same position if any
+        # (we avoid doing that too much since this potentially creates 2 n^2 new variables)
+        has_overlap = False
+        for i in range(n):
+            for j in range(i):
+                if vx[i] == vx[j] and vy[i] == vy[j]:
+                    if verbose:
+                        print('forbid overlap of squares {} and {}'.format(i, j))
+                    M.add_constraint(x[i] - x[j] + 3 * n * xdiff[i,j] + y[i] - y[j] + 3 * n * ydiff[i,j] >= 1)
+                    M.add_constraint(x[j] - x[i] + 3 * n * (1 - xdiff[i,j]) + y[i] - y[j] + 3 * n * ydiff[i,j] >= 1)
+                    M.add_constraint(x[i] - x[j] + 3 * n * xdiff[i,j] + y[j] - y[i] + 3 * n * (1 - ydiff[i,j]) >= 1)
+                    M.add_constraint(x[j] - x[i] + 3 * n * (1 - xdiff[i,j]) + y[j] - y[i] + 3 * n * (1 - ydiff[i,j]) >= 1)
+                    has_overlap = True
+                    if not all_overlaps:
+                        break
+            if has_overlap and not all_overlaps:
+                break
+
+        if len(comps) == 1 and not has_overlap:
+            G = DiGraph(n, multiedges=False, loops=False)
+            for i in range(n):
+                if not vr_cut[i] and i != r[i]:
+                    G.add_edge(i, r[i], 'r')
+                if not vu_cut[i] and i != u[i]:
+                    G.add_edge(i, u[i], 'u')
+            return G
+
+
+def snake_layout(r, u, cut_first=False, all_overlaps=False, verbose=False):
+    r"""
+    Return a snake layout if any
+
+    A snake layout is a soft layout in which the spanning tree is a path (in
+    particular we have a hamiltonian path of the underlying graph)
 
     This function uses integer linear programming and it is strongly advised to
     use a decent solver. The only one installed by default in sage (GLPK) turns
@@ -140,6 +291,8 @@ def soft_layout(r, u, cut_first=False, all_overlaps=False, verbose=False):
                 if not vu_cut[i] and i != u[i]:
                     G.add_edge(i, u[i], 'u')
             return G
+
+
 
 ############
 # Plotting #
